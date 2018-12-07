@@ -3,7 +3,6 @@ package simpleraft
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -16,46 +15,18 @@ import (
 	"github.com/hashicorp/raft-boltdb"
 )
 
-var (
-	ErrNotLeader = errors.New("not leader")
-)
-
 const (
-	retainSnapshotCount = 2
-	applyTimeout        = 10 * time.Second
-	openTimeout         = 120 * time.Second
-	leaderWaitDelay     = 100 * time.Millisecond
-	appliedWaitDelay    = 100 * time.Millisecond
+	retainSnapshotCount     = 2
+	defalutHeartbeetTimeout = 1 * time.Second
+	defaultApplyTimeout     = 10 * time.Second
+	defaultOpenTimeout      = 120 * time.Second
+	leaderWaitDelay         = 100 * time.Millisecond
+	appliedWaitDelay        = 100 * time.Millisecond
 )
 
 type Transport interface {
 	net.Listener
 	Dial(address string, timeout time.Duration) (net.Conn, error)
-}
-
-type ClusterState int
-
-const (
-	Leader ClusterState = iota
-	Follower
-	Candidate
-	Shutdown
-	Unknown
-)
-
-func (state ClusterState) String() string {
-	switch state {
-	case Leader:
-		return "leader"
-	case Follower:
-		return "follower"
-	case Candidate:
-		return "candidate"
-	case Shutdown:
-		return "shutdown"
-	default:
-		return "unknown"
-	}
 }
 
 type Node struct {
@@ -88,13 +59,14 @@ func New(c *NodeConfig, service Service, coder CommandCoder) *Node {
 	}
 
 	return &Node{
-		raftDir:       c.Dir,
-		raftTransport: c.Tn,
-		logger:        logger,
-		ApplyTimeout:  applyTimeout,
-		OpenTimeout:   openTimeout,
-		service:       service,
-		coder:         coder,
+		raftDir:          c.Dir,
+		raftTransport:    c.Tn,
+		logger:           logger,
+		HeartbeatTimeout: defalutHeartbeetTimeout,
+		ApplyTimeout:     defaultApplyTimeout,
+		OpenTimeout:      defaultOpenTimeout,
+		service:          service,
+		coder:            coder,
 	}
 }
 
@@ -159,20 +131,8 @@ func (n *Node) IsLeader() bool {
 	return n.raft.State() == raft.Leader
 }
 
-func (n *Node) State() ClusterState {
-	state := n.raft.State()
-	switch state {
-	case raft.Leader:
-		return Leader
-	case raft.Candidate:
-		return Candidate
-	case raft.Follower:
-		return Follower
-	case raft.Shutdown:
-		return Shutdown
-	default:
-		return Unknown
-	}
+func (n *Node) State() raft.RaftState {
+	return n.raft.State()
 }
 
 func (n *Node) Path() string {
@@ -187,7 +147,7 @@ func (n *Node) Leader() string {
 	return n.raft.Leader()
 }
 
-func (n *Node) Nodes() ([]string, error) {
+func (n *Node) Peers() ([]string, error) {
 	return n.peerStore.Peers()
 }
 
@@ -229,17 +189,17 @@ func (n *Node) WaitForAppliedIndex(idx uint64, timeout time.Duration) error {
 }
 
 func (n *Node) Execute(c Command) *FSMGenericResponse {
-	if n.raft.State() != raft.Leader {
-		return &FSMGenericResponse{
-			Err: ErrNotLeader,
-		}
-	}
-
 	if n.service.IsCmdReadOnly(c) {
 		result, err := n.service.HandleCmd(c)
 		return &FSMGenericResponse{
 			Err:    err,
 			Result: result,
+		}
+	}
+
+	if n.raft.State() != raft.Leader {
+		return &FSMGenericResponse{
+			Err: raft.ErrNotLeader,
 		}
 	}
 
@@ -252,9 +212,6 @@ func (n *Node) Execute(c Command) *FSMGenericResponse {
 
 	f := n.raft.Apply(b, n.ApplyTimeout)
 	if err := f.(raft.Future).Error(); err != nil {
-		if err == raft.ErrNotLeader {
-			err = ErrNotLeader
-		}
 		return &FSMGenericResponse{
 			Err: err,
 		}
@@ -266,15 +223,12 @@ func (n *Node) Execute(c Command) *FSMGenericResponse {
 func (n *Node) Join(addr string) error {
 	n.logger.Printf("received request to join node at %s", addr)
 	if n.raft.State() != raft.Leader {
-		return ErrNotLeader
+		return raft.ErrNotLeader
 	}
 
 	f := n.raft.AddPeer(addr)
 	if e := f.(raft.Future); e.Error() != nil {
-		if e.Error() == raft.ErrNotLeader {
-			return ErrNotLeader
-		}
-		e.Error()
+		return e.Error()
 	}
 	n.logger.Printf("node at %s joined successfully", addr)
 	return nil
@@ -298,6 +252,7 @@ func (n *Node) raftConfig() *raft.Config {
 	}
 	if n.HeartbeatTimeout != 0 {
 		config.HeartbeatTimeout = n.HeartbeatTimeout
+		config.ElectionTimeout = 10 * n.HeartbeatTimeout
 	}
 	return config
 }
