@@ -120,14 +120,10 @@ func init() {
 
 func main() {
 	flag.Parse()
-	transport, err := simpleraft.NewSimpleTransport(addr)
-	if err != nil {
-		panic(err.Error())
-	}
 
 	cfg := simpleraft.NodeConfig{
-		Dir: ".",
-		Tn:  transport,
+		Addr: addr,
+		Dir:  ".",
 	}
 
 	kv := newSimpleKV()

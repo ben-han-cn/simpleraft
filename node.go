@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"os"
@@ -16,12 +17,15 @@ import (
 )
 
 const (
-	retainSnapshotCount     = 2
 	defalutHeartbeetTimeout = 1 * time.Second
 	defaultApplyTimeout     = 10 * time.Second
 	defaultOpenTimeout      = 120 * time.Second
-	leaderWaitDelay         = 100 * time.Millisecond
-	appliedWaitDelay        = 100 * time.Millisecond
+	defaultConnPool         = 64
+	defaultConnTimeout      = 2 * time.Second
+
+	retainSnapshotCount = 2
+	leaderWaitDelay     = 100 * time.Millisecond
+	appliedWaitDelay    = 100 * time.Millisecond
 )
 
 type Transport interface {
@@ -30,10 +34,10 @@ type Transport interface {
 }
 
 type Node struct {
-	raftDir       string
-	raft          *raft.Raft // The consensus mechanism.
-	raftTransport Transport
-	peerStore     raft.PeerStore
+	addr      string
+	raftDir   string
+	raft      *raft.Raft // The consensus mechanism.
+	peerStore raft.PeerStore
 
 	logger *log.Logger
 
@@ -47,20 +51,20 @@ type Node struct {
 }
 
 type NodeConfig struct {
+	Addr   string
 	Dir    string
-	Tn     Transport
 	Logger *log.Logger
 }
 
 func New(c *NodeConfig, service Service, coder CommandCoder) *Node {
 	logger := c.Logger
 	if logger == nil {
-		logger = log.New(os.Stderr, "[store] ", log.LstdFlags)
+		logger = log.New(os.Stderr, "[simpleraft] ", log.LstdFlags)
 	}
 
 	return &Node{
+		addr:             c.Addr,
 		raftDir:          c.Dir,
-		raftTransport:    c.Tn,
 		logger:           logger,
 		HeartbeatTimeout: defalutHeartbeetTimeout,
 		ApplyTimeout:     defaultApplyTimeout,
@@ -75,7 +79,10 @@ func (n *Node) Open(peers []string) error {
 		return err
 	}
 
-	transport := raft.NewNetworkTransport(n.raftTransport, 3, 10*time.Second, os.Stderr)
+	transport, err := raft.NewTCPTransport(n.addr, nil, defaultConnPool, defaultConnTimeout, ioutil.Discard)
+	if err != nil {
+		return err
+	}
 
 	n.peerStore = raft.NewJSONPeers(n.raftDir, transport)
 	if len(peers) != 0 {
@@ -83,8 +90,7 @@ func (n *Node) Open(peers []string) error {
 	}
 
 	config := n.raftConfig()
-
-	peers, err := n.peerStore.Peers()
+	peers, err = n.peerStore.Peers()
 	if err != nil {
 		return err
 	}
@@ -139,8 +145,8 @@ func (n *Node) Path() string {
 	return n.raftDir
 }
 
-func (n *Node) Addr() net.Addr {
-	return n.raftTransport.Addr()
+func (n *Node) Addr() string {
+	return n.addr
 }
 
 func (n *Node) Leader() string {
@@ -254,6 +260,7 @@ func (n *Node) raftConfig() *raft.Config {
 		config.HeartbeatTimeout = n.HeartbeatTimeout
 		config.ElectionTimeout = 10 * n.HeartbeatTimeout
 	}
+	config.Logger = n.logger
 	return config
 }
 
